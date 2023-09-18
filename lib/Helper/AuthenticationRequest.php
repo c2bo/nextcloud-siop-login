@@ -2,14 +2,17 @@
 
 namespace OCA\OIDCLogin\Helper;
 
+use OC\User\LoginException;
 use OCA\OIDCLogin\Db\RequestObject;
 use OCA\OIDCLogin\Credentials\Anoncreds\AnoncredHelper;
 
-use Jose\Component\KeyManagement\JWKFactory;
-use Jose\Component\Signature\Algorithm\None;
 use Jose\Component\Core\AlgorithmManager;
+use Jose\Component\Signature\Algorithm\None;
+use Jose\Component\Signature\Algorithm\ES256;
 use Jose\Component\Signature\JWSBuilder;
 use Jose\Component\Signature\Serializer\CompactSerializer;
+use Jose\Component\KeyManagement\JWKFactory;
+use Jose\Component\KeyManagement\KeyConverter\ECKey
 
 class AuthenticationRequest
 {
@@ -66,24 +69,23 @@ class AuthenticationRequest
     public function createOnDevice(): string
     {
         $redirectUri = $this->urlGenerator->linkToRouteAbsolute($this->appName.'.login.callback');
-        $useRequestUri = $this->config->getSystemValue('oidc_login_use_request_uri', true);
-        return $this->createAuthenticationRequest($redirectUri, $useRequestUri);
+        return $this->createAuthenticationRequest($redirectUri);
     }
 
     public function createCrossDevice(): string
     {
         $redirectUri = $this->urlGenerator->linkToRouteAbsolute($this->appName.'.login.callback');
-        $useRequestUri = $this->config->getSystemValue('oidc_login_use_request_uri', true);
-        return $this->createAuthenticationRequest($redirectUri, $useRequestUri, 'direct_post');
+        return $this->createAuthenticationRequest($redirectUri, 'direct_post');
     }
 
-    private function createAuthenticationRequest($redirectUri, $useRequestUri, $responseMode = null): string
+    private function createAuthenticationRequest($redirectUri, $responseMode = null): string
     {
         $schema = $this->config->getSystemValue('oidc_login_request_domain', 'openid://');
+        $useRequestUri = $this->config->getSystemValue('oidc_login_use_request_uri', true);
+        $client_id_scheme = $this->config->getSystemValue('oidc_login_client_id_scheme', 'redirect_uri');
 
         $arData = array(
             'response_type' => 'vp_token',
-            'client_id' => $redirectUri,
             'redirect_uri' => $redirectUri,         
             'nonce' => $this->nonce
         );
@@ -92,21 +94,62 @@ class AuthenticationRequest
             $arData['response_mode'] = $responseMode;
         }
         
+        $jws = null;
         if ($useRequestUri) {
             $arData['presentation_definition'] = $this->presentationDefinition;
             if (!is_null($this->registration)) {
                 $arData['registration'] = $this->registration;
             }
+            if (!empty($client_id_scheme)) {
+                switch($client_id_scheme){
+                    case 'redirect_uri':
+                        // client_id_scheme == redirect_uri --> client id must equal redirect uri
+                        // Authorization request MUST NOT be signed
+                        $arData['client_id_scheme'] = 'redirect_uri';
+                        $arData['client_id'] = $redirectUri;
+                    case 'verifier_attestation':
+                        // client_id_scheme == verifier_attestation -->
+                        // - Client Identifier MUST equal the sub claim value
+                        // - request MUST be signed with the private key corresponding
+                        //   to the public key in the cnf claim in the Verifier attestation JWT
+                        $arData['client_id_scheme'] = 'verifier_attestation';
+                        // For the current demo implementation, we expect the private key to issue ourselves a verifier_attestation
+                        // private key needs to be P256
+                        $verifier_attestation_privkey = $this->config->getSystemValue('oidc_login_verifier_attestation_privkey');
+                        $verifier_attestation_cert = $this->config->getSystemValue('oidc_login_verifier_attestation_cert');
+                        // wallet attestation key not found
+                        if(is_null($verifier_attestation_privkey) || is_null($verifier_attestation_cert)) {
+                            throw new LoginException("verifier_attestation set but files not configured");
+                        }
+                        $cert_raw = file_get_contents($verifier_attestation_cert);
 
-            // Create request object as JWT signed with the none algorithm
-            $algorithmManager = new AlgorithmManager([new None()]);
-            $jwk = JWKFactory::createNoneKey();
-            $jwsBuilder = new JWSBuilder($algorithmManager);
-            $jws = $jwsBuilder
-                        ->create()
-                        ->withPayload(json_encode($arData))
-                        ->addSignature($jwk, ['alg' => 'none'])
-                        ->build();
+                        algorithmManager = new AlgorithmManager([new ES256()]);
+                        $jwk = JWKFactory::createFromKeyFile($verifier_attestation_privkey);
+                        $jwsBuilder = new JWSBuilder($algorithmManager);
+                        $jws = $jwsBuilder
+                                ->create()
+                                ->withPayload(json_encode($arData))
+                                ->addSignature($jwk, ['alg' => 'ES256'])
+                                ->build();
+                    default:
+                        throw new LoginException("unsupported client_id_scheme set");
+                }
+            } else {
+                // if nothing is set, we default to the old behavior
+                $arData['client_id_scheme'] = 'redirect_uri';
+                $arData['client_id'] = $redirectUri;
+            }
+            if (is_null($jws)) {
+                // Create request object as JWT signed with the none algorithm
+                $algorithmManager = new AlgorithmManager([new None()]);
+                $jwk = JWKFactory::createNoneKey();
+                $jwsBuilder = new JWSBuilder($algorithmManager);
+                $jws = $jwsBuilder
+                            ->create()
+                            ->withPayload(json_encode($arData))
+                            ->addSignature($jwk, ['alg' => 'none'])
+                            ->build();
+            }
             $serializer = new CompactSerializer();
             $token = $serializer->serialize($jws, 0);
  
